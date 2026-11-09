@@ -84,10 +84,11 @@ Threshold:
   k = 5 (tf(E) = 20001, tf(E) * N = 2000100000) is OK, k = 4
   (tf(E) = 25001, tf(E) * N = 2500100000) is wrong.
 
-  Our hypothesis is a 32-bit overflow in a computation that multiplies a term
-  frequency by the number of documents (an estimate in the OR / AND_NOT
-  postlists?). We have not checked it in the xapian sources: it is only a
-  guess from the threshold.
+  This is not an integer overflow: it is a rounding to 0.5 of an estimated
+  term frequency (see "Where is the bug" below). The estimated termfreq of
+  AND(E, ALL) is tf(E) * N / (2^32 - 1); it goes from 0 to 1 when
+  tf(E) * N >= 2^31. This changes the order of the AND sub-postlists, and the
+  wrong code path below is then taken.
 
   We first saw the bug on a real glass database. The glass backend and the
   in-memory backend give the same result.
@@ -99,3 +100,37 @@ Variants that give the right result (xapian 2.0.0 and 2.1.0):
   - the AND_NOT moved out of the OR ("factorized" query above):
       (E OR D) AND (ALL AND_NOT S) AND VALUE_RANGE(0, 'm', 'm')
   - fewer documents (tf(E) * N below 2^31).
+
+Where is the bug (reading of the xapian-core 2.1.0 sources, not traced in a
+debugger):
+
+  matcher/orpostlist.cc, OrPostList::check():
+
+      if (advance_r) {
+          if (r->at_end()) {
+              PostList* result = l;
+              l = NULL;
+              pltree->force_recalc();
+              valid = true;          // <-- l_valid is lost
+              return result;
+          }
+      }
+
+  (the symmetric block for l has the same problem). Just before, when
+  l->check() returned "not valid" (here: AndNotPostList::check() on docid 3,
+  which has the term S), the code sets l_did = 0 and advance_l = false. If r
+  is then at end, the OR decays to l and reports valid = true, although l is
+  positioned on a docid that it excludes. The parent AndPostList then accepts
+  docid 3.
+
+  In 1.4.30, OrPostList::check() propagates the validity of the kept child
+  (valid = lvalid / rvalid), which is why 1.4.30 gives the right result.
+
+  Why the threshold: ContiguousAllDocsPostList (ALL) does not override
+  get_docid_range(), so its range stays [1, 2^32 - 1] and the AndPostList
+  constructor (matcher/andpostlist.h) scales the estimate of AND(E, ALL) by
+  N / (2^32 - 1). Below the threshold the estimates are 0 and the OR is not
+  checked from the VALUE_RANGE side, so the faulty path is not taken.
+
+  Possible fix: in OrPostList::check(), keep l_valid / r_valid and use it
+  when decaying to the remaining child, instead of valid = true.
